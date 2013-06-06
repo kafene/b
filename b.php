@@ -1,184 +1,302 @@
 <?php
 
-class b {
-  static $db, $entries;
-  static function run() {
-    self::$db = new \PDO('sqlite:b.db');
-    self::$db->setAttribute(\PDO::ATTR_ERRMODE, \PDO::ERRMODE_EXCEPTION);
-    self::$db->query("CREATE TABLE IF NOT EXISTS b
-    ( id INTEGER PRIMARY KEY
-    , date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    , desc TEXT NOT NULL DEFAULT ''
-    , link TEXT NOT NULL DEFAULT '' UNIQUE);");
-    self::handleRequest();
-    $s = empty($_GET['s']) ? '%' : $_GET['s'];
-    $st = self::$db->prepare('SELECT * FROM b WHERE desc LIKE ? ORDER BY date DESC');
-    $st->execute(["%$s%"]);
-    self::$entries = $st->fetchAll(\PDO::FETCH_ASSOC);
-  }
-  static function handleRequest() {
-    if(empty($_POST['action'])) { return; }
-    $error = true; $result = [];
-    $id = $result['id'] = !empty($_POST['id']) ? $_POST['id'] : false;
-    error_reporting(0); ini_set('display_errors', 0);
-    try {
-      switch($_POST['action']) {
-        case 'add':
-          $result['url'] = $_POST['url'];
-          $force = $result['force'] = !empty($_POST['force']);
-          list($link, $desc) = false === strpos($_POST['url'], ' ')
-            ? [$_POST['url'], '']
-            : explode(' ', $_POST['url'], 2);
-          if(($ch = curl_init($link)) === false) {
-            if(!$force) { throw new \Exception('curlerr2'); }
-          } else {
-            curl_setopt_array($ch, [
-                \CURLOPT_RETURNTRANSFER => true
-              , \CURLOPT_SSL_VERIFYPEER => false
-              , \CURLOPT_FOLLOWLOCATION => true
-              , \CURLOPT_AUTOREFERER    => true
-              , \CURLOPT_TIMEOUT        => 5
-              , \CURLOPT_USERAGENT      => 'Mozilla, AppleWebKit, Gecko, Chrome'
-            ]);
-            if(($body = curl_exec($ch)) === false && !$force)
-                throw new \Exception('curlerr2');
-          }
-          if(!empty($body)) {
-            if(!preg_match('@<title>([^<]+)@', $body, $m)) {
-              $desc = '(unknown title)'.($desc ? " - $desc" : '');
-            } else {
-              $ret = $m[1];
-              $ec = mb_detect_encoding($ret, 'UTF-8,ISO-8859-1', true);
-              if($ec !== 'UTF-8') $ret = mb_convert_encoding($ret,'UTF-8',$ec);
-              $ret = trim(html_entity_decode($ret, \ENT_QUOTES, 'UTF-8'));
-              $desc = $ret.($desc ? " - $desc" : '');
+class B {
+    public $db;
+    static $entries = [], $hashtags = [];
+
+    function __construct($file = 'b.db') {
+        $new = !file_exists($file);
+        $this->db = new \PDO("sqlite:$file");
+        $this->db->setAttribute(\PDO::ATTR_ERRMODE, \PDO::ERRMODE_EXCEPTION);
+        if($new) {
+            $this->db->prepare("CREATE TABLE IF NOT EXISTS b (
+                id INTEGER PRIMARY KEY,
+                date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                desc TEXT NOT NULL DEFAULT '',
+                link TEXT NOT NULL DEFAULT '' UNIQUE
+            );")->execute();
+        }
+    }
+
+    static function init() {
+        $b = new static;
+        $b->server();
+        $filter = empty($_GET['filter']) ? false : $_GET['filter'];
+        $st = $b->db->prepare('SELECT * FROM b WHERE desc LIKE ? ORDER BY date DESC');
+        $st->execute(["%".($filter ?: '%')."%"]);
+        static::$entries = $st->fetchAll(\PDO::FETCH_ASSOC) ?: [];
+        $sql = 'SELECT desc as ht FROM b WHERE desc LIKE "%#%"';
+        $hashtags = [];
+        array_map(function($tag) use(&$hashtags) {
+            $tag = $tag['ht'];
+            if(preg_match_all('/\W(#\w+)/', $tag, $tags)) {
+                $hashtags = array_merge($hashtags, $tags[1]);
             }
-          } else { $desc = $link.($desc ? " - $desc" : ''); }
-          self::$db->prepare('INSERT INTO b (desc,link) VALUES (?,?)')->execute([$desc, $link]);
-          $error = false;
-          break;
-        case 'delete':
-          if($id) {
-            self::$db->prepare('DELETE FROM b WHERE id=?')->execute([$id]);
+        }, $b->db->query($sql)->fetchAll(\PDO::FETCH_ASSOC));
+        static::$hashtags = $hashtags;
+    }
+
+    function server() {
+        $error = false;
+        $result = null;
+        set_exception_handler(function(\Exception $e) use(&$result, &$error) {
+            $result['message'] = $e->getMessage() ?: 'unknown error';
+            $result['error'] = $error = true;
+            exit(json_encode($result, JSON_FORCE_OBJECT));
+        });
+        # Only reply to JSON requests.
+        if(empty($_POST['action'])
+        || 'XMLHttpRequest' !== getenv('HTTP_X_REQUESTED_WITH')
+        || 'POST' !== getenv('REQUEST_METHOD')) {
+            return;
+        }
+        list($error, $result, $action) = [true, [], strtolower($_POST['action'])];
+        $result['id'] = $id = (!empty($_POST['id']) ? $_POST['id'] : false);
+        # Add an entry
+        if('add' == $action && isset($_POST['url']))
+        {
+            $result['url'] = $_POST['url'];
+            $result['force'] = !empty($_POST['force']);
+            list($url, $desc) = strpos($_POST['url'], ' ')
+                ? explode(' ', $_POST['url'], 2)
+                : [$_POST['url'], ''];
+            $this->add($url, $desc, !empty($_POST['force']));
             $error = false;
-          }
-          break;
-        case 'settitle':
-          if($id && !empty($_POST['title'])) {
-            self::$db->prepare('UPDATE b SET desc=? WHERE id=?')->execute([$_POST['title'], $id]);
+        }
+        # Delete an entry
+        elseif('delete' == $action && $id)
+        {
+            $this->db->prepare("DELETE FROM b WHERE id = :id")->execute([$id]);
             $error = false;
+        }
+        # Set an entry's title
+        elseif('settitle' == $action && $id && !empty($_POST['title']))
+        {
+            $sql = "UPDATE b SET desc = ? WHERE id = ?";
+            $this->db->prepare($sql)->execute([$_POST['title'], $id]);
             $result['title'] = self::formatDesc($_POST['title']);
             $result['rawTitle'] = $_POST['title'];
-          }
-          break;
-        case 'setlink':
-          if($id && !empty($_POST['link'])) {
-            self::$db->prepare('UPDATE b SET link=? WHERE id=?')->execute([$_POST['link'], $id]);
             $error = false;
+        }
+        # Set an entry's link
+        elseif('setlink' == $action && $id && !empty($_POST['link']))
+        {
+            $sql = "UPDATE b SET link = ? WHERE id = ?";
+            $this->db->prepare($sql)->execute([$_POST['link'], $id]);
             $result['link'] = $_POST['link'];
-          }
-          break;
-        default: return false;
-      }
-    } catch(\Exception $e) { $result['message'] = $e->getMessage(); }
-    $result['result'] = $error ? false : true;
-    exit(json_encode($result, \JSON_FORCE_OBJECT));
-  }
-  static function formatDesc($desc) {
-    $desc = '<b>'.self::h($desc);
-    foreach(preg_match_all('@#[a-z0-9-_]+@', $desc, $m) ? $m[0] : [] as $i => $m)
-      $desc = str_replace($m, '', $desc).(0 === $i ? '</b>' : '')
-            . '<a class="tag" href="?s='.rawurlencode($m).'">'.$m.'</a> , ';
-    return rtrim($desc, ', ').(false === strpos($desc, '</b>') ? '</b>' : '');
-  }
-  static function h($str) {
-    $flags = \ENT_QUOTES | \ENT_HTML5 | \ENT_DISALLOWED | \ENT_SUBSTITUTE;
-    return htmlspecialchars($str, $flags, 'UTF-8', false);
-  }
+            $error = false;
+        }
+        $result['result'] = !$error;
+        exit(json_encode($result, JSON_FORCE_OBJECT));
+    }
+
+    function add($url, $appendDesc = '', $force = false) {
+        if(!$force && (($ch = curl_init($url)) === false)) {
+            throw new \Exception('could not init curl');
+        }
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
+        if(!$force && (($body = curl_exec($ch)) === false)) {
+            throw new \Exception('could not fetch');
+        }
+        curl_close($ch);
+        if(!empty($body)) {
+            $desc = preg_match('@<title[^>]*>([^<]+)@', $body, $m)
+                ? $m[1]
+                : preg_replace('/^http\:\/\//i', '', $url);
+            $enc = mb_detect_encoding($desc, 'UTF-8,ISO-8859-1', true);
+            if($enc !== 'UTF-8') {
+                $desc = mb_convert_encoding($desc, 'UTF-8', $enc);
+            }
+            $desc = trim(html_entity_decode($desc, ENT_QUOTES, 'UTF-8')).' '.$appendDesc;
+        } else {
+            $desc = $url;
+        }
+        $sql = 'INSERT INTO b (desc, link) VALUES (?, ?)';
+        return $this->db->prepare($sql)->execute([$desc, $url]);
+    }
+
+    static function formatDesc($desc) {
+        $desc = static::h($desc);
+        if(preg_match_all('@\b#\w+\b@', $desc, $m)) {
+            foreach($m[0] as $m) {
+                $m = trim($m);
+                $link = '</a> <a class="hash" href="?filter=';
+                $link.= rawurlencode($m).'">'.$m.'</a>';
+                $desc = str_replace($m, trim($link), $desc);
+                $desc = str_replace('</a></a>', '</a>', $desc);
+            }
+        }
+        return $desc;
+    }
+
+    static function h($v) {
+        return htmlspecialchars($v, ENT_QUOTES, 'UTF-8');
+    }
 }
 
-b::run();
-?><!doctype html><html><head><meta charset="utf-8"><title>b</title><style>
-html { font:16px/125% "Segoe UI", "Droid Sans", "DejaVu Sans", sans-serif; }
-body { max-width:900px; margin:0 auto; } a#home { color:#000; float:right; }
-a { color:#990000; } .link a { color:#869DD4; } .entry b { display:block; }
-.entry b:hover { background:#FFFAD8; cursor:pointer; }
-header, .entry { border-bottom:1px solid #ccc; padding:5px; }
-header { padding:1em 5px; } 
-.entry .link:hover { background:#EEFFEE; cursor:pointer; }
-input { width:50%; border:1px solid #ccc; padding:3px 2px; }
-</style></head><body><div class="content"><header><form>
-<input type="text" value="" name="query" placeholder="http(s)://... | search">
-<a id="home" href="<?= basename($_SERVER['SCRIPT_NAME']) ?>">home</a>
-</form></header><?php foreach(b::$entries as $e): ?>
-<div class="entry" id="entry_<?= $e['id'] ?>" data-id="<?= $e['id'] ?>" data-title="<?= b::h($e['desc']) ?>">
-<div class="title"><?= b::formatDesc($e['desc']); ?></div>
-<div class="link"><a target="_blank" href="<?= b::h($e['link']) ?>"><?= b::h($e['link']) ?></a></div>
-</div><!-- /.entry --><?php endforeach; ?></div><!-- /.content -->
-<script src="http://ajax.googleapis.com/ajax/libs/jquery/1.7.1/jquery.min.js"></script>
+B::init();
+
+?><!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>b</title>
+<style>
+body { background-color: #fff; font-family: sans-serif; }
+a { color: #2F2318; }
+a.hash { color: #6979A8; }
+a.desc { color: #869DD4; }
+.entry {
+  display: block;
+  padding-bottom: 10px;
+  padding-top: 10px;
+  border: 1px solid #fff;
+  border-bottom: 1px solid #6979A8;
+}
+header { padding-bottom: 10px; }
+.entry { padding-left: 1%; }
+.entry a.title:hover, .entry a.link:hover {
+  cursor:pointer; text-decoration:underline;
+}
+input { width: 500px; }
+#hashtags {
+    max-width: 40%;
+    border: 1px solid #ccc;
+    margin: 1em;
+    padding: 1em;
+}
+#hashtags h2 { margin: 0 0 0.5em; }
+</style>
+<script src="http://code.jquery.com/jquery-2.0.0.min.js"></script>
+</head>
+<body>
+<div class="content">
+
+<header>
+<form>
+<input autofocus type="text" name="query" value="" placeholder="http://... <- enter new url here and press return | or enter filter query">
+</form>
+</header>
+
+<?php foreach(B::$entries as $e): ?>
+<div class="entry"
+    id="entry_<?= $e['id'] ?>"
+    data-id="<?= $e['id'] ?>"
+    data-title="<?= B::h($e['desc']) ?>"
+    data-href="<?= B::h($e['link']) ?>"
+    data-date="<?= B::h($e['date']) ?>">
+<a class="desc" href="<?= B::h($e['link']) ?>"><?= B::formatDesc($e['desc']) ?></a><br>
+<small>edit: <a class="title">title</a> / <a class="link" id="link_<?= $e['id'] ?>">link</a></small>
+</div>
+<?php endforeach; ?>
+
+<div id="hashtags">
+<h2>hashtags</h2>
+<a class="hash" href="?">clear</a>
+<?php foreach(B::$hashtags as $tag): ?>
+<a class="hash" href="?filter=<?= rawurlencode($tag) ?>"><?= $tag ?></a>
+<?php endforeach; ?>
+</div>
+
+</div>
 <script>
-function deleteEntry(id) {
-  $.post('',{action:'delete',id:id},function(data){
-    var data = JSON.parse(data);
-    if(data.message) { alert(data.message); }
-    if(data.result === true) { $('#entry_'+data.id).remove(); }
-  });
+function parse_json(data) {
+    try { data = JSON.parse(data); } catch(a) { alert(data); }
+    return data;
 }
-function setTitle(id, title) {
-  $.post('',{action:'settitle',id:id,title:title},function(data){
-    var data = JSON.parse(data);
-    if(data.message) { alert(data.message); }
-    if(data.result === true) {
-      $('#entry_'+data.id+' .title').html(data.title);
-      $('#entry_'+data.id).attr('data-title', data.rawTitle);
-    } else { alert('err1'); }
-  });
-}
-function setLink(id, link) {
-  $.post('',{action:'setlink',id:id,link:link },function(data){
-    var data = JSON.parse(data);
-    if(data.message) { alert(data.message); }
-    if(data.result === true) {
-      $('#entry_'+data.id+' a.link').html(data.link);
-      $('#entry_'+data.id+' a.link').attr('href', data.link);
-    } else { alert('err2'); }
-  });
-}
+
 function addUrl(url, force) {
-  var input = $(':input');
-  input.attr('disabled', 'disabled');
-  $.post('',{action:'add',url:url,force:force?'1':'0'},function(data){
-    var data = JSON.parse(data);
-    if(!data.force && data.message === 'curlerr2') {
-      if(confirm('could not fetch, force?')) { addUrl(data.url, true); return; }
-      input.removeAttr('disabled'); input.focus(); return;
-    }
-    if(data.message) { alert(data.message); }
-    if(data.result === true) { document.location.reload(); }
-    input.removeAttr('disabled'); input.focus();
-  });
+    var input = $(':input');
+    input.attr('disabled', 'disabled');
+    $.post('', {
+        action: 'add',
+        url: url,
+        force: force ? '1' : '0'
+    }, function(data) {
+        var data = parse_json(data);
+        if (!data.force && data.message === 'could not fetch') {
+            if (confirm('could not fetch, add anyway?')) {
+                addUrl(data.url, true);
+                return;
+            }
+            input.removeAttr('disabled');
+            input.focus();
+            return;
+        }
+        if (data.message) alert(data.message);
+        if (data.result === true) document.location.reload();
+        input.removeAttr('disabled');
+        input.focus();
+    });
 }
-$('div.title b').click(function(e) {
-  var ret, tgt = e.target, id = $(tgt).parents('.entry').data('id');
-  var p = $(tgt).parents('.entry').data('title').split("\n").join(' ').trim();
-  if(!(ret = prompt('new name to rename, or `-` to delete #'+id, p))) { return false; }
-  if(ret === '-' && confirm('really delete?')) { deleteEntry(id); return false; }
-  setTitle(id, ret); return false;
+
+$('.link').click(function(ev) {
+    var target = ev.target;
+    var tid = $(target).attr('id').replace(/[^0-9]*/, '');
+    var href = $('#entry_'+ tid).data('href');
+    var link = prompt('edit url', href);
+    if (link === null) return;
+    $.post('', {
+        action: 'setlink',
+        id: tid,
+        link: link
+    }, function(data) {
+        var data = parse_json(data);
+        if (data.message) alert(data.message);
+        if (data.result === true) {
+            $('#entry_'+ data.id +' .desc').attr('href', data.link);
+        } else {
+            alert('err');
+        }
+    });
 });
-$('div.link').click(function(e) {
-  var tgt = e.target, ret;
-  if(tgt && tgt.className === 'link') {
-    var id = $(tgt).parents('.entry').data('id');
-    var href = $('a', tgt).attr('href');
-    if(null === (ret = prompt('new url for #'+id+':', href))) { return; }
-    setLink(id, ret);
-  }
+
+$('.title').click(function(ev) {
+    var target = ev.target;
+    var tid = $(target).closest('.entry').data('id');
+    var rawTitle = $(target).closest('.entry').data('title');
+    var title = prompt('rename, or `-` to delete', rawTitle);
+    if (!title) return;
+    if (title === '-') {
+        if(confirm('really delete?')) {
+            $.post('', {
+                action: 'delete',
+                id: tid
+            }, function(data) {
+                var data = JSON.parse(data) || alert(data);
+                if (data.message) alert(data.message);
+                if (data.result === true) $('#entry_'+ data.id).remove();
+            });
+        }
+        return;
+    }
+    $.post('', {
+        action: 'settitle',
+        id: tid,
+        title: title
+    }, function(data) {
+        var data = parse_json(data);
+        if (data.message) alert(data.message);
+        if (data.result === true) {
+            $('#entry_'+ data.id +' .desc').html(data.title);
+            $('#entry_'+ data.id).attr('data-title', data.rawTitle);
+        } else {
+            alert('err');
+        }
+    });
 });
+
 $('form').submit(function(e) {
-  if(e.preventDefault) { e.preventDefault(); }
-  var q = $(':input').val();
-  if(0 === (q.indexOf('http:') & q.indexOf('https:'))) { addUrl(q); return false; }
-  document.location.href = "?s="+encodeURIComponent(q); return false;
+    var query = $(':input').val();
+    if (query.indexOf('http:') === 0 || query.indexOf('https:') === 0) {
+        addUrl(query);
+        return false;
+    }
+    document.location.href = "?filter="+ encodeURIComponent(query);
+    return false;
 });
 </script>
 </body>
