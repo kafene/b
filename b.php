@@ -1,303 +1,485 @@
 <?php
 
-class B {
-    public $db;
-    static $entries = [], $hashtags = [];
+class BookmarkManager
+{
+    /**
+     * @var \PDO SQLite Database Connection
+     */
+    protected $db;
 
-    function __construct($file = 'b.db') {
-        $new = !file_exists($file);
-        $this->db = new \PDO("sqlite:$file");
-        $this->db->setAttribute(\PDO::ATTR_ERRMODE, \PDO::ERRMODE_EXCEPTION);
-        if($new) {
-            $this->db->prepare("CREATE TABLE IF NOT EXISTS b (
-                id INTEGER PRIMARY KEY,
-                date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                desc TEXT NOT NULL DEFAULT '',
-                link TEXT NOT NULL DEFAULT '' UNIQUE
-            );")->execute();
+    /**
+     * @var array SQL Queries
+     */
+    protected $sql = [
+        'add'      => "INSERT INTO b (title, link) VALUES (?, ?)",
+        'delete'   => "DELETE FROM b WHERE id = ?",
+        'settitle' => "UPDATE b SET title = ? WHERE id = ?",
+        'setlink'  => "UPDATE b SET link = ? WHERE id = ?",
+    ];
+
+    /**
+     * Constructor
+     *
+     * @param string $filename SQLite Database filename
+     */
+    public function __construct($filename = 'b.db')
+    {
+        # Start an output buffer
+        ob_start();
+
+        # Set up error handlers
+        $this->handleErrors();
+
+        # Strip out existing sqlite DSN prefix
+        $filename = preg_replace('/^sqlite:/i', '', $filename);
+
+        $this->db = new \PDO("sqlite:$filename", null, null, [
+            \PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION,
+            \PDO::ATTR_DEFAULT_FETCH_MODE => \PDO::FETCH_ASSOC,
+        ]);
+
+        # Create tables
+        $this->db->exec("CREATE TABLE IF NOT EXISTS b (
+            id INTEGER PRIMARY KEY,
+            time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            title TEXT NOT NULL DEFAULT '',
+            link TEXT NOT NULL DEFAULT '' UNIQUE
+        );");
+
+        # Run AJAX request handler
+        $this->server();
+    }
+
+    /**
+     * Send a JSON response
+     *
+     * @param array $params data to json-encode.
+     */
+    protected function json(array $params)
+    {
+        $defaults = [
+            'error' => false,
+            'message' => null,
+        ];
+        $params = array_merge($defaults, $params);
+
+        $json = json_encode($params, JSON_FORCE_OBJECT);
+        if (JSON_ERROR_NONE !== json_last_error()) {
+            throw new \Exception("JSON Encoding Failed.");
         }
+
+        header('HTTP/1.1 200 OK', true, 200);
+        header('Content-Type: application/json;charset=UTF-8');
+        exit($json);
     }
 
-    static function init() {
-        $b = new static;
-        $b->server();
-        $filter = empty($_GET['filter']) ? false : $_GET['filter'];
-        $st = $b->db->prepare('SELECT * FROM b WHERE desc LIKE ? ORDER BY date DESC');
-        $st->execute(["%".($filter ?: '%')."%"]);
-        static::$entries = $st->fetchAll(\PDO::FETCH_ASSOC) ?: [];
-        $sql = 'SELECT desc as ht FROM b WHERE desc LIKE "%#%"';
-        $hashtags = [];
-        array_map(function($tag) use(&$hashtags) {
-            $tag = $tag['ht'];
-            if(preg_match_all('/\W(#\w+)/', $tag, $tags)) {
-                $hashtags = array_merge($hashtags, $tags[1]);
+    /**
+     * Set up error handlers
+     *
+     * Automatically send JSON errors for AJAX requests,
+     * otherwise prints an informative error message.
+     */
+    protected function handleErrors()
+    {
+        set_exception_handler($ex = function (\Exception $e) {
+            # Flush output buffers
+            while (ob_get_level()) {
+                ob_end_clean();
             }
-        }, $b->db->query($sql)->fetchAll(\PDO::FETCH_ASSOC));
-        static::$hashtags = $hashtags;
+
+            if ($this->isAjax()) {
+                $this->json([
+                    'error'     => true,
+                    'file'      => $e->getFile(),
+                    'code'      => $e->getCode(),
+                    'line'      => $e->getLine(),
+                    'message'   => $e->getMessage(),
+                    'trace'     => $e->getTrace(),
+                    'exception' => $e,
+                ]);
+            }
+            # Regular HTTP requests
+            $errstr = 'HTTP/1.1 500 Internal Server Error';
+            header($errstr, true, 500);
+            exit(sprintf(
+                '<html><head><title>%s</title></head><body><h3>%s</h3>
+                <ul style="font-family:monospace;white-space:pre-line">
+                <li>Error [%d]: %s</li><li>File: %s</li><li>Line: %d</li>
+                </ul><hr><pre>%s</pre></body></html>',
+                $errstr,
+                $errstr,
+                $e->getCode(),
+                $e->getMessage(),
+                $e->getFile(),
+                $e->getLine(),
+                $e->getTraceAsString()
+            ));
+        });
+
+        # Convert errors to exceptions.
+        set_error_handler(function ($n, $s, $f, $l) use ($ex) {
+            throw new \ErrorException($s, $n, 0, $f, $l);
+        });
     }
 
-    function server() {
-        $error = false;
-        $result = null;
-        set_exception_handler(function(\Exception $e) use(&$result, &$error) {
-            $result['message'] = $e->getMessage() ?: 'unknown error';
-            $result['error'] = $error = true;
-            exit(json_encode($result, JSON_FORCE_OBJECT));
-        });
-        # Only reply to JSON requests.
-        if(empty($_POST['action'])
-        || 'XMLHttpRequest' !== getenv('HTTP_X_REQUESTED_WITH')
-        || 'POST' !== getenv('REQUEST_METHOD')) {
+    /**
+     * Determine if the request is an AJAX request
+     * It must have an 'action' parameter to be considered one.
+     *
+     * @return boolean
+     */
+    protected function isAjax()
+    {
+        $xhr = 'HTTP_X_REQUESTED_WITH';
+        return array_key_exists($xhr, $_SERVER)
+            && array_key_exists('REQUEST_METHOD', $_SERVER)
+            && array_key_exists('action', $_POST)
+            && 0 === strcasecmp('POST', $_SERVER['REQUEST_METHOD'])
+            && 0 === strcasecmp('xmlhttprequest', $_SERVER[$xhr])
+            && !empty($_POST['action']);
+    }
+
+    /**
+     * Adds a bookmark link to the database.
+     *
+     * @param string $link Link/URL
+     */
+    protected function add($link)
+    {
+        $link = trim($link);
+        list($link, $append) = strpos($link, ' ')
+            ? explode(' ', $link, 2)
+            : array($link, '');
+
+        $title = $this->extractTitle($link);
+        $title = trim("$title $append");
+
+        $this->db->prepare($this->sql['add'])->execute([$title, $link]);
+    }
+
+    /**
+     * Handles AJAX requests and sends a JSON response.
+     */
+    protected function server()
+    {
+        if (!$this->isAjax()) {
             return;
         }
-        list($error, $result, $action) = [true, [], strtolower($_POST['action'])];
-        $result['id'] = $id = (!empty($_POST['id']) ? $_POST['id'] : false);
-        # Add an entry
-        if('add' == $action && isset($_POST['url']))
-        {
-            $result['url'] = $_POST['url'];
-            $result['force'] = !empty($_POST['force']);
-            list($url, $desc) = strpos($_POST['url'], ' ')
-                ? explode(' ', $_POST['url'], 2)
-                : [$_POST['url'], ''];
-            $this->add($url, $desc, !empty($_POST['force']));
-            $error = false;
+
+        # Init response data
+        $r['action'] = $action = strtolower($_POST['action']);
+        $r['id'] = $id = empty($_POST['id']) ? null : $_POST['id'];
+        $r['link'] = $link = empty($_POST['link']) ? null : $_POST['link'];
+        $r['title'] = $title = empty($_POST['title']) ? null : $_POST['title'];
+
+        if ($r['title']) {
+            $r['rawTitle'] = $title;
+            $r['title'] = $this->formatTitle($title);
+            $r['tags'] = $this->formatTags($title);
         }
-        # Delete an entry
-        elseif('delete' == $action && $id)
-        {
-            $this->db->prepare("DELETE FROM b WHERE id = :id")->execute([$id]);
-            $error = false;
+
+        if ('add' === $action && $link) {
+            $this->add($link);
+        } elseif ('delete' === $action && $id) {
+            $this->db->prepare($this->sql['delete'])->execute([$id]);
+        } elseif ('settitle' === $action && $id && $title) {
+            $this->db->prepare($this->sql['settitle'])->execute([$title, $id]);
+        } elseif ('setlink' === $action && $id && $link) {
+            $this->db->prepare($this->sql['setlink'])->execute([$link, $id]);
+        } else {
+            $r['error'] = true;
+            $r['message'] = "Invalid action.";
         }
-        # Set an entry's title
-        elseif('settitle' == $action && $id && !empty($_POST['title']))
-        {
-            $sql = "UPDATE b SET desc = ? WHERE id = ?";
-            $this->db->prepare($sql)->execute([$_POST['title'], $id]);
-            $result['title'] = self::formatDesc($_POST['title']);
-            $result['rawTitle'] = $_POST['title'];
-            $error = false;
-        }
-        # Set an entry's link
-        elseif('setlink' == $action && $id && !empty($_POST['link']))
-        {
-            $sql = "UPDATE b SET link = ? WHERE id = ?";
-            $this->db->prepare($sql)->execute([$_POST['link'], $id]);
-            $result['link'] = $_POST['link'];
-            $error = false;
-        }
-        $result['result'] = !$error;
-        exit(json_encode($result, JSON_FORCE_OBJECT));
+
+        # Send the response
+        $this->json($r);
     }
 
-    function add($url, $appendDesc = '', $force = false) {
-        if(!$force && (($ch = curl_init($url)) === false)) {
-            throw new \Exception('could not init curl');
-        }
+    /**
+     * Fetch the contents of a link/url
+     *
+     * @param string $link
+     *
+     * @return string
+     */
+    protected function fetch($link)
+    {
+        $ch = curl_init($link);
         curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
         curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
         curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
         curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
-        if(!$force && (($body = curl_exec($ch)) === false)) {
-            throw new \Exception('could not fetch');
-        }
+        # curl_setopt($ch, CURLOPT_TIMEOUT, 5);
+        $ret = curl_exec($ch);
         curl_close($ch);
-        if(!empty($body)) {
-            $desc = preg_match('@<title[^>]*>([^<]+)@', $body, $m)
-                ? $m[1]
-                : preg_replace('/^http\:\/\//i', '', $url);
-            $enc = mb_detect_encoding($desc, 'UTF-8,ISO-8859-1', true);
-            if($enc !== 'UTF-8') {
-                $desc = mb_convert_encoding($desc, 'UTF-8', $enc);
-            }
-            $desc = trim(html_entity_decode($desc, ENT_QUOTES, 'UTF-8')).' '.$appendDesc;
-        } else {
-            $desc = $url;
-        }
-        $sql = 'INSERT INTO b (desc, link) VALUES (?, ?)';
-        return $this->db->prepare($sql)->execute([$desc, $url]);
+        return $ret;
     }
 
-    static function formatDesc($desc) {
-        $desc = static::h($desc);
-        if(preg_match_all('@\b#\w+\b@', $desc, $m)) {
-            foreach($m[0] as $m) {
-                $m = trim($m);
-                $link = '</a> <a class="hash" href="?filter=';
-                $link.= rawurlencode($m).'">'.$m.'</a>';
-                $desc = str_replace($m, trim($link), $desc);
-                $desc = str_replace('</a></a>', '</a>', $desc);
-            }
+    /**
+     * Extract a title from a link
+     * If the title can not be detected from a fetched
+     * url, it will be the link stripped of its protocol.
+     *
+     * @param string $link
+     *
+     * @return string
+     */
+    protected function extractTitle($link)
+    {
+        $body = $this->fetch($link);
+
+        # Either use title extracted from the site, or the link w/o protocol.
+        $title = ($body && preg_match('/<title[^>]*>([^<]+)/i', $body, $m))
+            ? $m[1]
+            : preg_replace('/^[a-z]+:\/\//i', '', $link);
+
+        # Fix encoding
+        $encoding = mb_detect_encoding($title, 'UTF-8,ISO-8859-1', true);
+        if ($encoding !== 'UTF-8') {
+            $title = mb_convert_encoding($title, 'UTF-8', $encoding);
         }
-        return $desc;
+
+        return trim(html_entity_decode($title, ENT_QUOTES, 'UTF-8'));
     }
 
-    static function h($v) {
-        return htmlspecialchars($v, ENT_QUOTES, 'UTF-8');
+    /**
+     * Get all entries for display on the page
+     *
+     * @return array
+     */
+    public function getEntries()
+    {
+        $filter = empty($_GET['filter']) ? '%' : $_GET['filter'];
+        $filter = "%$filter%";
+
+        $sql = "SELECT * FROM b WHERE title LIKE ? ORDER BY time DESC";
+        $st = $this->db->prepare($sql);
+        $st->execute([$filter]);
+
+        $entries = $st->fetchAll() ?: [];
+        foreach ($entries as &$e) {
+            $e['rawTitle'] = $this->e($e['title']);
+            $e['link'] = $this->e($e['link']);
+            $e['time'] = $this->e($e['time']);
+            $e['tags'] = $this->formatTags($e['title']);
+            $e['title'] = $this->formatTitle($e['title']);
+        }
+
+        return $entries;
     }
+
+    /**
+     * Format an entry title
+     *
+     * @param string $title The entry title
+     * @param boolean $tags whether to format tags in the title
+     *
+     * @return string
+     */
+    protected function formatTitle($title)
+    {
+        return trim(preg_replace('/\W(#\w+)/', '', $this->e($title)));
+    }
+
+    /**
+     * Format tags in an entry title
+     *
+     * @param string $title The entry title
+     *
+     * @return string
+     */
+    protected function formatTags($title)
+    {
+        $format = '<a class="hash" href="?filter=%s">%s</a>';
+        return trim(join(' ', array_map(function ($tag) use ($format) {
+            return sprintf($format, rawurlencode($tag), $tag);
+        }, preg_match_all('/\W(#\w+)/', $this->e($title), $m) ? $m[1] : [])));
+    }
+
+    /**
+     * Escape some string with htmlspecialchars
+     *
+     * @param string The string to escape
+     *
+     * @return string
+     */
+    protected function e($str)
+    {
+        return htmlspecialchars($str, ENT_QUOTES, 'UTF-8', false);
+    }
+
 }
 
-B::init();
+$b = new BookmarkManager;
 
 ?><!doctype html>
 <html>
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width; initial-scale=1.0;">
 <title>b</title>
+<script src="http://code.jquery.com/jquery-2.0.3.min.js"></script>
+<link href='http://fonts.googleapis.com/css?family=Electrolize' rel='stylesheet' type='text/css'>
+<link rel="stylesheet" href="http://cdnjs.cloudflare.com/ajax/libs/normalize/2.1.3/normalize.min.css"/>
 <style>
-body { background-color: #fff; font-family: sans-serif; }
-a { color: #2F2318; }
-a.hash { color: #6979A8; }
-a.desc { color: #869DD4; }
-.entry {
-  display: block;
-  padding-bottom: 10px;
-  padding-top: 10px;
-  border: 1px solid #fff;
-  border-bottom: 1px solid #6979A8;
+* {
+    box-sizing: border-box;
 }
-header { padding-bottom: 10px; }
-.entry { padding-left: 1%; }
-.entry a.title:hover, .entry a.link:hover {
-  cursor:pointer; text-decoration:underline;
+body {
+    background-color: #fff;
+    font-family: sans-serif;
+    margin: 10px;
+    max-width: 800px;
 }
-input { width: 500px; }
-#hashtags {
-    max-width: 40%;
-    border: 1px solid #ccc;
-    margin: 1em;
-    padding: 1em;
+a {
+    color: #2F2318;
+    text-decoration: none;
+    cursor: pointer;
 }
-#hashtags h2 { margin: 0 0 0.5em; }
+a:hover {
+    text-decoration: underline;
+}
+a.hash {
+    color: #6979A8;
+}
+a.link {
+    color: #869DD4;
+}
+header {
+    padding: 0 0 10px 0;
+}
+input {
+    padding: 2px;
+    margin: 0;
+    width: 100%;
+}
+.tags {
+    font-size: smaller;
+}
+article {
+    display: block;
+    padding: 10px 0 10px 1%;
+    border: 1px solid #fff;
+    border-bottom: 1px solid #6979A8;
+}
+article a.title {
+    width: 100%;
+    display: block;
+}
+article a.title:hover {
+    background-color: #FFFAD8;
+}
+article a.link {
+    color: #999;
+    word-wrap: break-word;
+    font-size: smaller;
+}
 </style>
-<script src="http://code.jquery.com/jquery-2.0.0.min.js"></script>
 </head>
 <body>
-<div class="content">
 
 <header>
 <form>
-<input autofocus type="text" name="query" value="" placeholder="http://... <- enter new url here and press return | or enter filter query">
+<input autofocus type="text" name="query" id="query">
 </form>
 </header>
 
-<?php foreach(B::$entries as $e): ?>
-<div class="entry"
+<?php foreach ($b->getEntries() as $e): ?>
+<article class="entry"
     id="entry_<?= $e['id'] ?>"
     data-id="<?= $e['id'] ?>"
-    data-title="<?= B::h($e['desc']) ?>"
-    data-href="<?= B::h($e['link']) ?>"
-    data-date="<?= B::h($e['date']) ?>">
-<a class="desc" href="<?= B::h($e['link']) ?>"><?= B::formatDesc($e['desc']) ?></a><br>
-<small>edit: <a class="title">title</a> / <a class="link" id="link_<?= $e['id'] ?>">link</a></small>
-</div>
-<?php endforeach; ?>
+    data-title="<?= $e['rawTitle'] ?>"
+    data-href="<?= $e['link'] ?>"
+    data-time="<?= $e['time'] ?>">
+    <a class="title" title="<?= $e['title'] ?> (<?= $e['time'] ?>)">
+        <?= $e['title'] ?>
+    </a>
+    <a class="link" target="_blank" href="<?= $e['link'] ?>">
+        <?= $e['link'] ?>
+    </a>
+    <div class="tags">
+        <?= $e['tags'] ?>
+    </div>
+</article>
+<?php endforeach ?>
 
-<div id="hashtags">
-<h2>hashtags</h2>
-<a class="hash" href="?">clear</a>
-<?php foreach(B::$hashtags as $tag): ?>
-<a class="hash" href="?filter=<?= rawurlencode($tag) ?>"><?= $tag ?></a>
-<?php endforeach; ?>
-</div>
-
-</div>
 <script>
-function parse_json(data) {
-    try { data = JSON.parse(data); } catch(a) { alert(data); }
-    return data;
-}
+$('.title').click(function (e) {
+    var id = $(this).parent('article').data('id');
+    var rawTitle = $(this).parent('article').data('title');
+    var ret = prompt('rename or, `-` to delete', rawTitle);
 
-function addUrl(url, force) {
-    var input = $(':input');
-    input.attr('disabled', 'disabled');
-    $.post('', {
-        action: 'add',
-        url: url,
-        force: force ? '1' : '0'
-    }, function(data) {
-        var data = parse_json(data);
-        if (!data.force && data.message === 'could not fetch') {
-            if (confirm('could not fetch, add anyway?')) {
-                addUrl(data.url, true);
-                return;
-            }
-            input.removeAttr('disabled');
-            input.focus();
-            return;
-        }
-        if (data.message) alert(data.message);
-        if (data.result === true) document.location.reload();
-        input.removeAttr('disabled');
-        input.focus();
-    });
-}
-
-$('.link').click(function(ev) {
-    var target = ev.target;
-    var tid = $(target).attr('id').replace(/[^0-9]*/, '');
-    var href = $('#entry_'+ tid).data('href');
-    var link = prompt('edit url', href);
-    if (link === null) return;
-    $.post('', {
-        action: 'setlink',
-        id: tid,
-        link: link
-    }, function(data) {
-        var data = parse_json(data);
-        if (data.message) alert(data.message);
-        if (data.result === true) {
-            $('#entry_'+ data.id +' .desc').attr('href', data.link);
-        } else {
-            alert('err');
-        }
-    });
-});
-
-$('.title').click(function(ev) {
-    var target = ev.target;
-    var tid = $(target).closest('.entry').data('id');
-    var rawTitle = $(target).closest('.entry').data('title');
-    var title = prompt('rename, or `-` to delete', rawTitle);
-    if (!title) return;
-    if (title === '-') {
-        if(confirm('really delete?')) {
-            $.post('', {
-                action: 'delete',
-                id: tid
-            }, function(data) {
-                var data = JSON.parse(data) || alert(data);
-                if (data.message) alert(data.message);
-                if (data.result === true) $('#entry_'+ data.id).remove();
-            });
-        }
+    if (!ret) {
         return;
     }
-    $.post('', {
-        action: 'settitle',
-        id: tid,
-        title: title
-    }, function(data) {
-        var data = parse_json(data);
-        if (data.message) alert(data.message);
-        if (data.result === true) {
-            $('#entry_'+ data.id +' .desc').html(data.title);
-            $('#entry_'+ data.id).attr('data-title', data.rawTitle);
-        } else {
-            alert('err');
+
+    if (ret === '-') {
+        if (confirm('really delete?')) {
+            $.post('', {action: 'delete', id: id}, function (data) {
+                data.message && alert(data.message);
+
+                data.error || $('#entry_'+data.id).remove();
+            });
+        }
+
+        return;
+    }
+
+    $.post('', {action: 'settitle', id: id, title: ret}, function (data) {
+        data.message && alert(data.message);
+
+        if (!data.error) {
+            $('#entry_'+data.id+' .title').html(data.title);
+            $('#entry_'+data.id+' .tags').html(data.tags);
+            $('#entry_'+data.id).data('title', data.rawTitle);
         }
     });
 });
 
-$('form').submit(function(e) {
-    var query = $(':input').val();
-    if (query.indexOf('http:') === 0 || query.indexOf('https:') === 0) {
-        addUrl(query);
+
+$('.entry').dblclick(function (e) {
+    var id = $(this).data('id');
+    var href = $(this).data('href');
+    var ret = prompt('edit link', href);
+
+    if (!ret) {
+        return;
+    }
+
+    $.post('', {action: 'setlink', id: id, link: ret}, function (data) {
+        data.message && alert(data.message);
+
+        if (!data.error) {
+            $('#entry_'+data.id+' .link').html(data.link);
+            $('#entry_'+data.id+' .link').prop('href', data.link);
+            $('#entry_'+data.id).data('href', data.link);
+        }
+    });
+});
+
+
+$('form').submit(function (e) {
+    var input = $('#query');
+    var query = $('#query').val();
+    if (/^https?:\/\//i.test(query)) {
+        input.prop('disabled', true);
+
+        $.post('', {action: 'add', url: query}, function (data) {
+            data.message && alert(data.message);
+            data.error || document.location.reload();
+            input.prop('disabled', false);
+            input.focus();
+        });
+
         return false;
     }
-    document.location.href = "?filter="+ encodeURIComponent(query);
+
+    document.location.href = "?filter=" + encodeURIComponent(query);
+
     return false;
 });
+
+$("#query").focus();
 </script>
 </body>
 </html>
